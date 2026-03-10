@@ -1,11 +1,8 @@
 import numpy as np
 
+def cosine_similarity(a, b):
 
-def cosine_similarity(emb1, emb2):
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
 
-    emb1 = emb1 / np.linalg.norm(emb1)
-    emb2 = emb2 / np.linalg.norm(emb2)
-
-    similarity = np.dot(emb1, emb2)
-
-    return similarity
+    return float(np.dot(a, b))

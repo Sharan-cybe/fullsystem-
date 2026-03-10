@@ -1,20 +1,22 @@
-import cv2
 from insightface.app import FaceAnalysis
 
-# Load model once (CPU only)
-model = FaceAnalysis(
-    name="buffalo_s",
-    providers=["CPUExecutionProvider"]
-)
+face_model = None
 
-# Prepare detection
-model.prepare(
-    ctx_id=0,
-    det_size=(320, 320)
-)
+
+def get_face_model():
+    global face_model
+
+    if face_model is None:
+
+        face_model = FaceAnalysis(name="buffalo_l")
+        face_model.prepare(ctx_id=0, det_size=(320, 320))
+
+    return face_model
 
 
 def get_face_embedding(image):
+
+    model = get_face_model()
 
     faces = model.get(image)
 

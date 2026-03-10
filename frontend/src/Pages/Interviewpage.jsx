@@ -1,10 +1,10 @@
-import InterviewVerifcation from "../components/InterviewVerifcation";
+import InterviewVerification from "../components/InterviewVerification";
 
 const InterviewPage = () => {
 
   return (
     <div>
-      <InterviewVerifcation />
+      <InterviewVerification />
     </div>
   );
 
