@@ -18,10 +18,26 @@ face_mesh = mp_face_mesh.FaceMesh(
     refine_landmarks=True
 )
 
+# stores current step
 sessions = {}
+
+# stores final results
+completed_sessions = {}
+
+THRESHOLD = 0.5
 
 
 def verify_interview(unique_id, webcam_image):
+
+    # if verification finished earlier → stop immediately
+    if unique_id in completed_sessions:
+        return completed_sessions[unique_id]
+
+    # check if user exists
+    embed_path = f"{EMBED_STORAGE}/{unique_id}.npy"
+
+    if not os.path.exists(embed_path):
+        return {"status": "User not found"}
 
     frame = cv2.imdecode(
         np.frombuffer(webcam_image, np.uint8),
@@ -55,7 +71,9 @@ def verify_interview(unique_id, webcam_image):
 
     direction = get_eye_direction(landmarks)
 
-    # STEP 1
+    # --------------------
+    # STEP 1: LOOK LEFT
+    # --------------------
     if step == "LOOK_LEFT":
 
         if direction == "LEFT":
@@ -71,7 +89,9 @@ def verify_interview(unique_id, webcam_image):
             "face_box": [x1, y1, x2, y2]
         }
 
-    # STEP 2
+    # --------------------
+    # STEP 2: LOOK RIGHT
+    # --------------------
     if step == "LOOK_RIGHT":
 
         if direction == "RIGHT":
@@ -87,21 +107,22 @@ def verify_interview(unique_id, webcam_image):
             "face_box": [x1, y1, x2, y2]
         }
 
-    # STEP 3
+    # --------------------
+    # STEP 3: LOOK CENTER
+    # --------------------
     if step == "LOOK_CENTER":
 
         if direction == "CENTER":
 
-            # detect screen spoof
+            # screen spoof detection
             if detect_screen(frame):
-                sessions.pop(unique_id)
 
-                return {"status": "Mobile screen detected"}
+                result = {"status": "Mobile screen detected"}
 
-            embed_path = f"{EMBED_STORAGE}/{unique_id}.npy"
+                sessions.pop(unique_id, None)
+                completed_sessions[unique_id] = result
 
-            if not os.path.exists(embed_path):
-                return {"status": "Face data not found"}
+                return result
 
             stored_emb = np.load(embed_path)
 
@@ -116,18 +137,27 @@ def verify_interview(unique_id, webcam_image):
 
             similarity = cosine_similarity(stored_emb, current_emb)
 
-            sessions.pop(unique_id)
+            sessions.pop(unique_id, None)
 
-            if similarity < 0.45:
-                return {
+            if similarity < THRESHOLD:
+
+                result = {
                     "status": "Face verification failed",
-                    "similarity": similarity
+                    "similarity": float(similarity)
                 }
 
-            return {
+                completed_sessions[unique_id] = result
+
+                return result
+
+            result = {
                 "status": "Verification successful",
-                "similarity": similarity
+                "similarity": float(similarity)
             }
+
+            completed_sessions[unique_id] = result
+
+            return result
 
         return {
             "status": "Look at the camera",
