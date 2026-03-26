@@ -12,6 +12,7 @@ from app.liveness.screen_detector import detect_screen
 from app.liveness.blink_detector import detect_blink
 
 EMBED_STORAGE = "app/storage/embeddings"
+INTERVIEW_FACES_STORAGE = "app/storage/interview_faces"
 
 # Configuration
 THRESHOLD = 0.45  
@@ -92,136 +93,210 @@ def verify_with_multiple_frames(stored_emb, frame_buffer, unique_id):
     """
     Verify face using multiple frames for better accuracy
     IMPROVED: Uses full frames with face detection instead of pre-cropped faces
+    Also returns the best frame (highest combined quality + similarity) for storage.
     """
-   
+    
     if len(frame_buffer) < MIN_FRAMES_FOR_VERIFICATION:
-        return None, "Collecting frames..."
-   
+        return None, "Collecting frames...", None
+    
     similarities = []
     successful_frames = 0
-   
-    for frame_data in frame_buffer:
+    frame_scores = []  # Track (index, similarity, quality, embedding, full_frame) for best frame selection
+    
+    for idx, frame_data in enumerate(frame_buffer):
         # Use the FULL frame, not the cropped face
         full_frame = frame_data['full_frame']
         face_box = frame_data['face_box']
         quality = frame_data['quality']
-       
+        
         # Validate frame
         if full_frame is None or full_frame.size == 0:
             continue
-       
+        
         # Resize full frame for consistent processing
         h, w = full_frame.shape[:2]
-       
+        
         # Scale to a reasonable size (max 1280 width)
         if w > 1280:
             scale = 1280 / w
             new_w = 1280
             new_h = int(h * scale)
             full_frame = cv2.resize(full_frame, (new_w, new_h))
-       
+        
         # Get embedding from FULL FRAME (InsightFace will detect face automatically)
         current_emb = get_face_embedding(full_frame)
-       
+        
         if current_emb is not None:
             similarity = cosine_similarity(stored_emb, current_emb)
-           
+            
             # Weight similarity by face quality
             weighted_similarity = similarity * (0.7 + 0.3 * quality)
-           
+            
             similarities.append(weighted_similarity)
             successful_frames += 1
-   
+            
+            # Track this frame for best-frame selection
+            # Combined score: 50% raw similarity to passport + 50% face quality
+            combined_score = (similarity * 0.5) + (quality * 0.5)
+            frame_scores.append({
+                'index': idx,
+                'similarity': similarity,
+                'quality': quality,
+                'combined_score': combined_score,
+                'embedding': current_emb,
+                'full_frame': frame_data['full_frame'],  # Original full frame
+                'face_box': face_box
+            })
+    
     # Need at least 3 successful frames (60% of 5)
     if successful_frames < 3:
-        return None, f"Face not clear (only {successful_frames}/{len(frame_buffer)} frames processed)"
-   
+        return None, f"Face not clear (only {successful_frames}/{len(frame_buffer)} frames processed)", None
+    
     # Use median similarity (more robust than mean)
     median_similarity = float(np.median(similarities))
-   
+    
     # Also check average of top 60% frames
     top_k = max(2, int(len(similarities) * 0.6))
     sorted_sims = sorted(similarities, reverse=True)
     top_avg = float(np.mean(sorted_sims[:top_k]))
-   
+    
     # Final similarity is weighted combination
     final_similarity = 0.6 * median_similarity + 0.4 * top_avg
-   
-    return final_similarity, None
+    
+    # Select the best frame (highest combined score of similarity + quality)
+    best_frame_data = max(frame_scores, key=lambda x: x['combined_score']) if frame_scores else None
+    
+    return final_similarity, None, best_frame_data
+
+
+def save_best_interview_frame(unique_id, best_frame_data):
+    """
+    Save the best interview frame as both JPEG image and embedding.
+    Stores in app/storage/interview_faces/{unique_id}/
+    
+    Args:
+        unique_id: The user's unique identifier
+        best_frame_data: Dict with 'full_frame', 'face_box', 'embedding', etc.
+    """
+    if best_frame_data is None:
+        print(f"[{unique_id}] No best frame data to save")
+        return False
+    
+    try:
+        # Create user's interview face directory
+        user_folder = f"{INTERVIEW_FACES_STORAGE}/{unique_id}"
+        os.makedirs(user_folder, exist_ok=True)
+        
+        full_frame = best_frame_data['full_frame']
+        face_box = best_frame_data['face_box']
+        embedding = best_frame_data['embedding']
+        
+        # --- Save face crop as JPEG ---
+        x1, y1, x2, y2 = face_box
+        face_crop = full_frame[y1:y2, x1:x2]
+        
+        if face_crop.size > 0:
+            # Save the cropped face image
+            face_path = f"{user_folder}/interview_face.jpg"
+            cv2.imwrite(face_path, face_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"[{unique_id}] Saved interview face image: {face_path}")
+        else:
+            # Fallback: save the full frame if crop fails
+            face_path = f"{user_folder}/interview_face.jpg"
+            cv2.imwrite(face_path, full_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"[{unique_id}] Saved full frame as fallback: {face_path}")
+        
+        # --- Save embedding as .npy ---
+        embed_path = f"{user_folder}/interview_face_embedding.npy"
+        np.save(embed_path, embedding)
+        print(f"[{unique_id}] Saved interview face embedding: {embed_path}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[{unique_id}] Error saving best interview frame: {e}")
+        return False
 
 
 def process_face_landmarks(frame):
     """
     Process frame and extract face landmarks using MediaPipe
     Creates and destroys FaceMesh instance to avoid camera lock
-   
+    
     Returns:
-        (landmarks, face_box) or (None, None) if no face detected
+        (landmarks, face_box, face_count) or (None, None, 0) if no face detected
+        face_count > 1 means multiple faces detected in the full frame
     """
-   
+    
     if frame is None or frame.size == 0:
-        return None, None
-   
+        return None, None, 0
+    
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-   
+    
     # Create fresh FaceMesh instance (will be auto-released when function exits)
     mp_face_mesh = mp.solutions.face_mesh
-   
+    
     # Use context manager to ensure proper cleanup
+    # max_num_faces=5 to detect multiple faces for warning
     with mp_face_mesh.FaceMesh(
         static_image_mode=True,  # For single images (no video stream)
-        max_num_faces=1,
+        max_num_faces=5,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     ) as face_mesh:
-       
+        
         result = face_mesh.process(rgb)
-       
+        
         if not result.multi_face_landmarks:
-            return None, None
-       
+            return None, None, 0
+        
+        # Count total faces detected in the full webcam frame
+        face_count = len(result.multi_face_landmarks)
+        
+        # Use the first (largest/most prominent) face for landmarks
         landmarks = result.multi_face_landmarks[0].landmark
-       
-        # Calculate face bounding box with better margins
+        
+        # Calculate face bounding box with generous margins
         xs = [lm.x for lm in landmarks]
         ys = [lm.y for lm in landmarks]
-       
+        
         # Get tight bbox first
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
-       
-        # Add padding (15% on each side) for better face crop
+        
+        # Add padding (40% on each side) for larger green box
+        # This captures head, hair, and part of shoulders
         width = max_x - min_x
         height = max_y - min_y
-       
-        pad_x = width * 0.15
-        pad_y = height * 0.15
-       
+        
+        pad_x = width * 0.40
+        pad_y = height * 0.40
+        
         # Apply padding
         min_x = max(0, min_x - pad_x)
         max_x = min(1.0, max_x + pad_x)
         min_y = max(0, min_y - pad_y)
         max_y = min(1.0, max_y + pad_y)
-       
+        
         # Convert to pixel coordinates
         x1 = max(0, int(min_x * w))
         y1 = max(0, int(min_y * h))
         x2 = min(w, int(max_x * w))
         y2 = min(h, int(max_y * h))
-       
+        
         # Validate bounding box
         if x2 <= x1 or y2 <= y1:
-            return None, None
-       
+            return None, None, face_count
+        
         # Ensure minimum size
         if (x2 - x1) < 60 or (y2 - y1) < 60:
-            return None, None
-       
+            return None, None, face_count
+        
         face_box = [x1, y1, x2, y2]
-       
-        return landmarks, face_box
+        
+        return landmarks, face_box, face_count
 
 
 def verify_interview(unique_id, webcam_image):
@@ -252,15 +327,24 @@ def verify_interview(unique_id, webcam_image):
         return {"status": "Invalid image", "error": True}
    
     # Process face with MediaPipe (creates and destroys instance)
-    landmarks, face_box = process_face_landmarks(frame)
-   
+    landmarks, face_box, face_count = process_face_landmarks(frame)
+    
     if landmarks is None or face_box is None:
         return {"status": "Face not detected", "instruction": "Position your face in the frame"}
-   
+    
+    # Check for multiple faces in the ENTIRE webcam frame
+    if face_count > 1:
+        return {
+            "status": "Multiple faces detected",
+            "face_box": face_box,
+            "instruction": f"{face_count} faces found. Only one person should be visible in the camera.",
+            "error": True
+        }
+    
     # Initialize or get session
     if unique_id not in sessions:
         sessions[unique_id] = SessionData()
-   
+    
     session = sessions[unique_id]
    
     # Detect blink for liveness
@@ -415,7 +499,7 @@ def verify_interview(unique_id, webcam_image):
             # Third: Perform face verification with multiple frames
             stored_emb = np.load(embed_path)
            
-            final_similarity, error_msg = verify_with_multiple_frames(
+            final_similarity, error_msg, best_frame_data = verify_with_multiple_frames(
                 stored_emb,
                 session.frame_buffer,
                 unique_id
@@ -444,14 +528,17 @@ def verify_interview(unique_id, webcam_image):
                 completed_sessions[unique_id] = CompletedSessionData(result)
                 return result
            
-            # SUCCESS!
+            # SUCCESS! Save the best interview frame
+            frame_saved = save_best_interview_frame(unique_id, best_frame_data)
+            
             result = {
                 "status": "Verification Successful",
                 "similarity": final_similarity,
                 "message": "Identity verified successfully",
-                "verified": True
+                "verified": True,
+                "interview_face_saved": frame_saved
             }
-           
+            
             # UPDATED: Store in wrapper with timestamp
             completed_sessions[unique_id] = CompletedSessionData(result)
             return result
